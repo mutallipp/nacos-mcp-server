@@ -3,272 +3,139 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { readFileSync, writeFileSync, existsSync } from "fs";
-import { homedir } from "os";
-import { join } from "path";
+import { resolve } from "path";
+import { pathToFileURL } from "url";
+import { getMessages, message } from "./i18n.js";
+import { NacosClient, NacosError } from "./nacos-client.js";
 
-const PROJECT_CONFIG_PATH = join(process.cwd(), ".nacos-mcp.json");
-const GLOBAL_CONFIG_PATH = join(homedir(), ".nacos-mcp.json");
-
-function loadConfig() {
-  const defaults = {
-    serverAddr: "127.0.0.1:8848",
-    contextPath: "/nacos",
-    namespace: "",
-    group: "DEFAULT_GROUP",
-    username: "nacos",
-    password: "nacos",
-  };
-  // 优先级: 项目目录 ~/.nacos-mcp.json > 用户目录 ~/.nacos-mcp.json > 环境变量 > 默认值
-  for (const configPath of [PROJECT_CONFIG_PATH, GLOBAL_CONFIG_PATH]) {
-    try {
-      if (existsSync(configPath)) {
-        const file = JSON.parse(readFileSync(configPath, "utf-8"));
-        console.error(`[Nacos] loaded config from ${configPath}`);
-        return { ...defaults, ...file };
-      }
-    } catch (e) {
-      console.error(`[Nacos] config load error (${configPath}): ${e.message}`);
-    }
-  }
-  return {
-    serverAddr: process.env.NACOS_SERVER_ADDR || defaults.serverAddr,
-    contextPath: process.env.NACOS_CONTEXT_PATH || defaults.contextPath,
-    namespace: process.env.NACOS_NAMESPACE || defaults.namespace,
-    group: process.env.NACOS_GROUP || defaults.group,
-    username: process.env.NACOS_USERNAME || defaults.username,
-    password: process.env.NACOS_PASSWORD || defaults.password,
-  };
-}
-
-// ─── NacosClient: 封装 Nacos 1.x Open API ───────────────────────────
-class NacosClient {
-  constructor() {
-    const cfg = loadConfig();
-    this.serverAddr = cfg.serverAddr;
-    this.contextPath = cfg.contextPath.replace(/\/+$/, "");
-    this.baseUrl = `http://${this.serverAddr}${this.contextPath}`;
-    this.username = cfg.username;
-    this.password = cfg.password;
-    this.defaultNamespace = cfg.namespace;
-    this.defaultGroup = cfg.group;
-    this.accessToken = null;
-    this.tokenExpireTime = 0;
-  }
-
-  async login() {
-    if (this.accessToken && Date.now() < this.tokenExpireTime) {
-      return this.accessToken;
-    }
-    try {
-      const url = `${this.baseUrl}/v1/auth/login`;
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: `username=${encodeURIComponent(this.username)}&password=${encodeURIComponent(this.password)}`,
-      });
-      if (!res.ok) {
-        console.error(`[Nacos] login failed: ${res.status}`);
-        this.accessToken = null;
-        return null;
-      }
-      const data = await res.json();
-      this.accessToken = data.accessToken;
-      const ttl = (data.tokenTtl || 18000) - 30;
-      this.tokenExpireTime = Date.now() + ttl * 1000;
-      console.error(`[Nacos] login success, token expires in ${ttl}s`);
-      return this.accessToken;
-    } catch (e) {
-      console.error(`[Nacos] login error: ${e.message}`);
-      this.accessToken = null;
-      return null;
-    }
-  }
-
-  async authQuery() {
-    const token = await this.login();
-    return token ? `accessToken=${encodeURIComponent(token)}&` : "";
-  }
-
-  /**
-   * 获取单个配置
-   * Nacos 1.x: GET /v1/cs/configs?dataId=xxx&tenant=xxx&group=xxx
-   */
-  async getConfig(dataId, namespace, group) {
-    const ns = namespace || this.defaultNamespace;
-    const grp = group || this.defaultGroup;
-    const auth = await this.authQuery();
-    const url = `${this.baseUrl}/v1/cs/configs?${auth}dataId=${encodeURIComponent(dataId)}&tenant=${encodeURIComponent(ns)}&group=${encodeURIComponent(grp)}`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`getConfig failed (${res.status}): ${text}`);
-    }
-    return await res.text();
-  }
-
-  /**
-   * 列出配置列表
-   * Nacos 1.x: GET /v1/cs/configs?search=accurate&dataId=&tenant=xxx&group=xxx&pageNo=1&pageSize=200
-   */
-  async listConfigs(namespace, group) {
-    const ns = namespace || this.defaultNamespace;
-    const grp = group || this.defaultGroup;
-    const auth = await this.authQuery();
-    const url = `${this.baseUrl}/v1/cs/configs?${auth}search=accurate&dataId=&tenant=${encodeURIComponent(ns)}&group=${encodeURIComponent(grp)}&pageNo=1&pageSize=200`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`listConfigs failed (${res.status}): ${text}`);
-    }
-    return await res.json();
-  }
-
-  /**
-   * 发布配置
-   * Nacos 1.x: POST /v1/cs/configs with form body
-   * 自动根据 dataId 扩展名设置 type（yaml/properties/json/text）
-   */
-  async publishConfig(dataId, content, namespace, group) {
-    const ns = namespace || this.defaultNamespace;
-    const grp = group || this.defaultGroup;
-    const token = await this.login();
-    const params = new URLSearchParams();
-    params.append("dataId", dataId);
-    params.append("group", grp);
-    params.append("tenant", ns);
-    params.append("content", content);
-    if (dataId.endsWith(".yaml") || dataId.endsWith(".yml")) {
-      params.append("type", "yaml");
-    } else if (dataId.endsWith(".properties")) {
-      params.append("type", "properties");
-    } else if (dataId.endsWith(".json")) {
-      params.append("type", "json");
-    } else {
-      params.append("type", "text");
-    }
-    if (token) params.append("accessToken", token);
-    const url = `${this.baseUrl}/v1/cs/configs`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: params.toString(),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`publishConfig failed (${res.status}): ${text}`);
-    }
-    return await res.text();
-  }
-
-  /**
-   * 获取全部配置内容
-   */
-  async getAllConfigs(namespace, group) {
-    const listResult = await this.listConfigs(namespace, group);
-    const items = listResult.pageItems || [];
-    const configs = [];
-    for (const item of items) {
-      try {
-        const content = await this.getConfig(item.dataId, namespace, group);
-        configs.push({ dataId: item.dataId, group: item.group, content });
-      } catch (e) {
-        configs.push({ dataId: item.dataId, group: item.group, error: e.message });
-      }
-    }
-    return configs;
-  }
-}
-
-// ─── MCP Server ──────────────────────────────────────────────────────
-const nacos = new NacosClient();
-const server = new McpServer({
-  name: "nacos-mcp-server",
-  version: "1.0.0",
+export const TOOL_CONTRACT = Object.freeze({
+  nacos_get_config: Object.freeze(["dataId", "namespace", "group"]),
+  nacos_list_configs: Object.freeze(["namespace", "group"]),
+  nacos_get_all_configs: Object.freeze(["namespace", "group"]),
+  nacos_publish_config: Object.freeze(["dataId", "content", "namespace", "group"]),
 });
 
-server.tool(
-  "nacos_get_config",
-  "获取 Nacos 中单个配置的内容。用于查看指定 dataId 的 yaml/properties 配置。",
-  {
-    dataId: z.string().describe("配置的 dataId，如 re-gateway.yaml、re-product.yaml"),
-    namespace: z.string().optional().describe("命名空间 ID，默认使用环境变量 NACOS_NAMESPACE"),
-    group: z.string().optional().describe("配置分组，默认使用环境变量 NACOS_GROUP"),
-  },
-  async ({ dataId, namespace, group }) => {
+function toolSchemas(messages) {
+  const scope = {
+    namespace: z.string().optional().describe(messages.namespace),
+    group: z.string().optional().describe(messages.group),
+  };
+  return {
+    get: { dataId: z.string().describe(messages.dataId), ...scope },
+    list: scope,
+    publish: {
+      dataId: z.string().describe(messages.dataId),
+      content: z.string().describe(messages.content),
+      ...scope,
+    },
+  };
+}
+
+/** 创建可注入客户端的 MCP server，导入模块时不启动 stdio。 */
+export function createServer({ nacos, language = process.env.NACOS_LANGUAGE } = {}) {
+  const messages = getMessages(language);
+  const client = nacos ?? createDefaultClient(messages);
+  const schemas = toolSchemas(messages);
+  const server = new McpServer({ name: "nacos-mcp-server", version: "1.0.0" });
+  registerReadTools(server, client, messages, schemas);
+  registerPublishTool(server, client, messages, schemas);
+  return server;
+}
+
+function createDefaultClient(messages) {
+  return new NacosClient({
+    messages,
+    logger: (logMessage) => console.error(message(messages, "runtimeLog", { message: logMessage })),
+  });
+}
+
+function registerReadTools(server, client, messages, schemas) {
+  server.tool("nacos_get_config", messages.toolGetConfig, schemas.get, getConfigHandler(client, messages));
+  server.tool("nacos_list_configs", messages.toolListConfigs, schemas.list, listConfigsHandler(client, messages));
+  server.tool("nacos_get_all_configs", messages.toolGetAllConfigs, schemas.list, getAllConfigsHandler(client, messages));
+}
+
+function getConfigHandler(client, messages) {
+  return async ({ dataId, namespace, group }) => {
     try {
-      const content = await nacos.getConfig(dataId, namespace, group);
+      const content = await client.getConfig(dataId, namespace, group);
       return { content: [{ type: "text", text: content }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `获取配置失败: ${e.message}` }], isError: true };
+    } catch (error) {
+      return toolError(messages, "getFailed", error);
     }
-  }
-);
+  };
+}
 
-server.tool(
-  "nacos_list_configs",
-  "列出 Nacos 中指定命名空间/分组下的所有配置项（dataId 列表）。",
-  {
-    namespace: z.string().optional().describe("命名空间 ID，默认使用环境变量 NACOS_NAMESPACE"),
-    group: z.string().optional().describe("配置分组，默认使用环境变量 NACOS_GROUP"),
-  },
-  async ({ namespace, group }) => {
+function listConfigsHandler(client, messages) {
+  return async ({ namespace, group }) => {
     try {
-      const result = await nacos.listConfigs(namespace, group);
-      const items = result.pageItems || [];
-      const lines = [
-        `配置列表 (共 ${result.totalCount || items.length} 项):`,
-        "",
-        ...items.map((item) => `- ${item.dataId}`),
-      ];
+      const result = await client.listConfigs(namespace, group);
+      const items = (Array.isArray(result?.pageItems) ? result.pageItems : []).filter(isRecord);
+      const lines = [message(messages, "listTitle", { total: result?.totalCount ?? items.length }), "", ...items.map((item) => `- ${String(item.dataId ?? "")}`)];
       return { content: [{ type: "text", text: lines.join("\n") }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `列出配置失败: ${e.message}` }], isError: true };
+    } catch (error) {
+      return toolError(messages, "listFailed", error);
     }
-  }
-);
+  };
+}
 
-server.tool(
-  "nacos_get_all_configs",
-  "获取 Nacos 中指定命名空间/分组下的全部配置内容。返回每个 dataId 对应的完整配置。",
-  {
-    namespace: z.string().optional().describe("命名空间 ID，默认使用环境变量 NACOS_NAMESPACE"),
-    group: z.string().optional().describe("配置分组，默认使用环境变量 NACOS_GROUP"),
-  },
-  async ({ namespace, group }) => {
+function getAllConfigsHandler(client, messages) {
+  return async ({ namespace, group }) => {
     try {
-      const configs = await nacos.getAllConfigs(namespace, group);
-      const parts = configs.map((c) => {
-        if (c.error) return `===== ${c.dataId} =====\n[错误] ${c.error}`;
-        return `===== ${c.dataId} =====\n${c.content}`;
-      });
+      const configs = await client.getAllConfigs(namespace, group);
+      const parts = (Array.isArray(configs) ? configs : []).filter(isRecord).map((config) => formatConfig(config, messages));
       return { content: [{ type: "text", text: parts.join("\n\n") }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `获取全部配置失败: ${e.message}` }], isError: true };
+    } catch (error) {
+      return toolError(messages, "getAllFailed", error);
     }
-  }
-);
+  };
+}
 
-server.tool(
-  "nacos_publish_config",
-  "发布配置到 Nacos。原样保存配置内容，不修改任何格式（缩进、注释、空行等）。使用前必须先通过 nacos_get_config 获取当前内容，在原始内容基础上修改后再发布。",
-  {
-    dataId: z.string().describe("配置的 dataId，如 re-gateway.yaml"),
-    content: z.string().describe("完整的配置内容，必须保持原始格式（YAML/properties 原样保存）"),
-    namespace: z.string().optional().describe("命名空间 ID，默认使用环境变量 NACOS_NAMESPACE"),
-    group: z.string().optional().describe("配置分组，默认使用环境变量 NACOS_GROUP"),
-  },
-  async ({ dataId, content, namespace, group }) => {
+function isRecord(value) {
+  return value !== null && !Array.isArray(value) && typeof value === "object";
+}
+
+function formatConfig(config, messages) {
+  if (config.error) return `===== ${String(config.dataId ?? "")} =====\n${message(messages, "itemError", { message: config.error })}`;
+  return `===== ${String(config.dataId ?? "")} =====\n${String(config.content ?? "")}`;
+}
+
+function registerPublishTool(server, client, messages, schemas) {
+  server.tool("nacos_publish_config", messages.toolPublishConfig, schemas.publish, publishConfigHandler(client, messages));
+}
+
+function publishConfigHandler(client, messages) {
+  return async ({ dataId, content, namespace, group }) => {
     try {
-      const result = await nacos.publishConfig(dataId, content, namespace, group);
-      return { content: [{ type: "text", text: `发布成功: ${dataId} (${result})` }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `发布配置失败: ${e.message}` }], isError: true };
+      await client.publishConfig(dataId, content, namespace, group);
+      return { content: [{ type: "text", text: message(messages, "publishSuccess", { dataId }) }] };
+    } catch (error) {
+      return toolError(messages, "publishFailed", error);
     }
-  }
-);
+  };
+}
 
-// ─── 启动 ────────────────────────────────────────────────────────────
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error("[Nacos MCP Server] started");
+function toolError(messages, key, error) {
+  const detail = error instanceof NacosError ? error.message : messages.toolUnexpectedError;
+  return {
+    content: [{ type: "text", text: message(messages, key, { message: detail }) }],
+    isError: true,
+  };
+}
+
+export async function start() {
+  const messages = getMessages(process.env.NACOS_LANGUAGE);
+  try {
+    const server = createServer({ language: process.env.NACOS_LANGUAGE });
+    await server.connect(new StdioServerTransport());
+    console.error(message(messages, "runtimeLog", { message: messages.started }));
+  } catch (error) {
+    const detail = error instanceof NacosError ? error.message : messages.startupFailed;
+    console.error(message(messages, "runtimeLog", { message: detail }));
+    process.exitCode = 1;
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  await start();
+}
