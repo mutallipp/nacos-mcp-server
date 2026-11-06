@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rmdir, symlink, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../src/index.js";
 import { getMessages, message } from "../src/i18n.js";
@@ -231,6 +236,66 @@ test("requires v3 success code and boolean data for publish", async () => {
     fetchImpl: queuedFetch([json({ code: 0, data: false })]),
   });
   await assert.rejects(falseData.publishConfig("demo.txt", "x"), /拒绝发布/);
+});
+
+async function createSymlinkBinFixture() {
+  const tempDir = await mkdtemp(join(tmpdir(), "nacos-mcp-bin-"));
+  const entry = join(tempDir, "nacos-mcp-server");
+  const source = fileURLToPath(new URL("../src/index.js", import.meta.url));
+  await symlink(source, entry);
+  return {
+    entry,
+    tempDir,
+    transport: new StdioClientTransport({
+      command: process.execPath,
+      args: [entry],
+      cwd: tempDir,
+      env: createIsolatedEnvironment(tempDir),
+      stderr: "pipe",
+    }),
+  };
+}
+
+function createIsolatedEnvironment(home) {
+  return {
+    HOME: home,
+    PATH: process.env.PATH ?? "",
+    NACOS_AUTH_MODE: "disabled",
+    NACOS_CONTEXT_PATH: "",
+    NACOS_LANGUAGE: "en-US",
+    NACOS_SERVER_ADDR: "127.0.0.1:65535",
+  };
+}
+
+async function removeSymlinkBinFixture(fixture) {
+  await unlink(fixture.entry);
+  await rmdir(fixture.tempDir);
+}
+
+async function assertFourTools(client) {
+  const result = await client.listTools();
+  assert.deepEqual(result.tools.map((tool) => tool.name), [
+    "nacos_get_config",
+    "nacos_list_configs",
+    "nacos_get_all_configs",
+    "nacos_publish_config",
+  ]);
+  return result;
+}
+
+test("starts the MCP server through a symbolic-link bin entry", async () => {
+  const fixture = await createSymlinkBinFixture();
+  const client = new Client({ name: "nacos-symlink-bin-test", version: "1.0.0" });
+  try {
+    await client.connect(fixture.transport);
+    await assertFourTools(client);
+  } finally {
+    try {
+      await client.close();
+    } finally {
+      await removeSymlinkBinFixture(fixture);
+    }
+  }
 });
 
 test("provides bilingual detailed errors and exposes four tools through MCP listTools", async () => {
